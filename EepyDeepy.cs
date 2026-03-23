@@ -6,6 +6,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using UnityEngine;
+using UnityEngine.Networking;
 
 namespace EepyDeepy
 {
@@ -36,7 +37,7 @@ namespace EepyDeepy
         private string configPath;
         private FileSystemWatcher configWatcher;
         private DateTime lastConfigReload = DateTime.MinValue;
-        private DateTime lastBedExit = DateTime.MinValue;
+        private DateTime lastBedExit      = DateTime.MinValue;
         private bool inBed = false;
 
         // Sequence state
@@ -44,6 +45,10 @@ namespace EepyDeepy
         private bool     sequenceActive = false;
         private int      playersInBed   = 0;
         private ZNetPeer lastBedPeer    = null;
+
+        // Audio
+        private AudioSource audioSource;
+        private AudioClip   lullaby;
 
         private void Awake()
         {
@@ -57,7 +62,41 @@ namespace EepyDeepy
             LoadConfig();
             StartConfigWatcher();
 
+            // Audio source component on this GameObject
+            audioSource       = gameObject.AddComponent<AudioSource>();
+            audioSource.loop  = true;
+            audioSource.volume = 0f;
+
+            string audioPath = Path.Combine(
+                Path.GetDirectoryName(Info.Location),
+                "lullaby.ogg"
+            );
+            StartCoroutine(LoadAudio(audioPath));
+
             Log.LogInfo($"{PluginName} v{PluginVersion} loaded.");
+        }
+
+        private IEnumerator LoadAudio(string path)
+        {
+            if (!File.Exists(path))
+            {
+                Log.LogWarning($"Lullaby not found at {path}. No music will play.");
+                yield break;
+            }
+
+            using (var req = UnityWebRequestMultimedia.GetAudioClip("file://" + path, AudioType.OGGVORBIS))
+            {
+                yield return req.SendWebRequest();
+
+                if (req.result != UnityWebRequest.Result.Success)
+                {
+                    Log.LogError($"Failed to load lullaby: {req.error}");
+                    yield break;
+                }
+
+                lullaby = DownloadHandlerAudioClip.GetContent(req);
+                Log.LogInfo("Lullaby loaded.");
+            }
         }
 
         private void LoadConfig()
@@ -120,7 +159,7 @@ namespace EepyDeepy
 
         public void OnPlayerBedEnter(ZNetPeer peer, string trigger)
         {
-            if (inBed) return;  // already in bed, ignore
+            if (inBed) return;
             inBed = true;
 
             playersInBed++;
@@ -133,12 +172,13 @@ namespace EepyDeepy
                 sequenceIndex  = 0;
                 Log.LogInfo($"Starting EepyDeepy sequence, triggered by {peer?.m_playerName} via {trigger}.");
                 StartCoroutine(RunSequence());
+                StartMusic();
             }
         }
 
         public void OnPlayerBedExit()
         {
-            if (!inBed) return;  // not in bed, ignore all the noise
+            if (!inBed) return;
             inBed = false;
 
             if ((DateTime.Now - lastBedExit).TotalSeconds < 2) return;
@@ -161,12 +201,48 @@ namespace EepyDeepy
         private void ResetSequence(string reason)
         {
             Log.LogInfo($"Resetting sequence: {reason}.");
-            inBed = false;
+            inBed          = false;
             sequenceActive = false;
             sequenceIndex  = 0;
             playersInBed   = 0;
             lastBedPeer    = null;
             StopAllCoroutines();
+            StartCoroutine(FadeOutMusic(3f));
+        }
+
+        private void StartMusic()
+        {
+            if (lullaby == null) return;
+            audioSource.clip = lullaby;
+            audioSource.volume = 0f;
+            audioSource.Play();
+            StartCoroutine(FadeInMusic(3f));
+        }
+
+        private IEnumerator FadeInMusic(float duration)
+        {
+            float t = 0f;
+            while (t < duration)
+            {
+                t += Time.deltaTime;
+                audioSource.volume = Mathf.Clamp01(t / duration);
+                yield return null;
+            }
+            audioSource.volume = 1f;
+        }
+
+        private IEnumerator FadeOutMusic(float duration)
+        {
+            float startVolume = audioSource.volume;
+            float t = 0f;
+            while (t < duration)
+            {
+                t += Time.deltaTime;
+                audioSource.volume = Mathf.Clamp01(startVolume * (1f - t / duration));
+                yield return null;
+            }
+            audioSource.Stop();
+            audioSource.volume = 0f;
         }
 
         private IEnumerator RunSequence()
@@ -219,7 +295,6 @@ namespace EepyDeepy
             if (!ZNet.instance.IsServer()) return;
             if (!__result) return;
 
-            // Find the peer that matches this humanoid
             ZNetPeer peer = null;
             foreach (var p in ZNet.instance.GetPeers())
             {
@@ -280,5 +355,4 @@ namespace EepyDeepy
             EepyDeepyPlugin.Instance.OnPlayerBedExit();
         }
     }
-
 }
