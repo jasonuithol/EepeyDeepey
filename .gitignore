@@ -1,0 +1,7 @@
+bin/
+obj/
+staging/
+release/
+*.kate-swp
+*.mp3
+*.ogg
