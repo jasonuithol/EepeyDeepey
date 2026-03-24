@@ -1,6 +1,8 @@
 using BepInEx;
 using BepInEx.Logging;
 using HarmonyLib;
+using Jotunn.Entities;
+using Jotunn.Managers;
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -22,11 +24,12 @@ namespace EepyDeepy
     }
 
     [BepInPlugin(PluginGUID, PluginName, PluginVersion)]
+    [BepInDependency(Jotunn.Main.ModGuid)]
     public class EepyDeepyPlugin : BaseUnityPlugin
     {
         public const string PluginGUID    = "com.byawn.eepydeepy";
         public const string PluginName    = "EepyDeepy";
-        public const string PluginVersion = "1.0.0";
+        public const string PluginVersion = "1.0.2";
 
         internal static ManualLogSource Log;
         internal static EepyDeepyPlugin Instance;
@@ -40,15 +43,21 @@ namespace EepyDeepy
         private DateTime lastBedExit      = DateTime.MinValue;
         private bool inBed = false;
 
-        // Sequence state
+        // Sequence state (server only)
         private int      sequenceIndex  = 0;
         private bool     sequenceActive = false;
         private int      playersInBed   = 0;
         private ZNetPeer lastBedPeer    = null;
 
-        // Audio
+        // Audio (client only)
         private AudioSource audioSource;
         private AudioClip   lullaby;
+
+        // Jotunn RPCs
+        internal CustomRPC bedEnterRPC;      // client -> server
+        internal CustomRPC bedExitRPC;       // client -> server
+        private CustomRPC playLullabyRPC;   // server -> all clients
+        private CustomRPC stopLullabyRPC;   // server -> all clients
 
         private void Awake()
         {
@@ -62,19 +71,94 @@ namespace EepyDeepy
             LoadConfig();
             StartConfigWatcher();
 
-            // Audio source component on this GameObject
-            audioSource       = gameObject.AddComponent<AudioSource>();
-            audioSource.loop  = true;
-            audioSource.volume = 0f;
+            // Only load audio on clients
+            if (!GUIManager.IsHeadless())
+            {
+                audioSource        = gameObject.AddComponent<AudioSource>();
+                audioSource.loop   = true;
+                audioSource.volume = 0f;
 
-            string audioPath = Path.Combine(
-                Path.GetDirectoryName(Info.Location),
-                "lullaby.ogg"
+                string audioPath = Path.Combine(
+                    Path.GetDirectoryName(Info.Location),
+                                                "lullaby.ogg"
+                );
+                StartCoroutine(LoadAudio(audioPath));
+            }
+
+            // client -> server: player entered bed/emote
+            bedEnterRPC = NetworkManager.Instance.AddRPC(
+                "BedEnter",
+                RPC_OnBedEnter,   // server handler
+                RPC_NoOp          // client handler (unused)
             );
-            StartCoroutine(LoadAudio(audioPath));
+
+            // client -> server: player left bed/emote
+            bedExitRPC = NetworkManager.Instance.AddRPC(
+                "BedExit",
+                RPC_OnBedExit,    // server handler
+                RPC_NoOp          // client handler (unused)
+            );
+
+            // server -> all clients: play lullaby
+            playLullabyRPC = NetworkManager.Instance.AddRPC(
+                "PlayLullaby",
+                RPC_NoOp,
+                RPC_OnPlayLullaby
+            );
+
+            // server -> all clients: stop lullaby
+            stopLullabyRPC = NetworkManager.Instance.AddRPC(
+                "StopLullaby",
+                RPC_NoOp,
+                RPC_OnStopLullaby
+            );
 
             Log.LogInfo($"{PluginName} v{PluginVersion} loaded.");
         }
+
+        // ---- RPC handlers ----
+
+        private IEnumerator RPC_NoOp(long sender, ZPackage package)
+        {
+            yield break;
+        }
+
+        // Server receives: a player got into bed or did /rest
+        private IEnumerator RPC_OnBedEnter(long sender, ZPackage package)
+        {
+            Log.LogInfo($"RPC_OnBedEnter received from {sender}.");
+
+            ZNetPeer peer = ZNet.instance.GetPeer(sender);
+            OnPlayerBedEnter(peer, "RPC");
+            yield break;
+        }
+
+        // Server receives: a player left bed or stopped /rest
+        private IEnumerator RPC_OnBedExit(long sender, ZPackage package)
+        {
+            Log.LogInfo($"RPC_OnBedExit received from {sender}.");
+            OnPlayerBedExit();
+            yield break;
+        }
+
+        // Client receives: start playing lullaby
+        private IEnumerator RPC_OnPlayLullaby(long sender, ZPackage package)
+        {
+            Log.LogInfo($"RPC_OnPlayLullaby received. lullaby={lullaby != null} audioSource={audioSource != null}");
+            StartMusic();
+            yield break;
+        }
+
+        // Client receives: stop playing lullaby
+        private IEnumerator RPC_OnStopLullaby(long sender, ZPackage package)
+        {
+            Log.LogInfo("RPC_OnStopLullaby received.");
+            StopAllCoroutines();
+            StartCoroutine(FadeOutMusic(3f));
+            yield break;
+        }
+
+        // ---- Audio ----
 
         private IEnumerator LoadAudio(string path)
         {
@@ -98,6 +182,45 @@ namespace EepyDeepy
                 Log.LogInfo("Lullaby loaded.");
             }
         }
+
+        private void StartMusic()
+        {
+            Log.LogInfo($"StartMusic called. lullaby={lullaby != null} audioSource={audioSource != null}");
+            if (lullaby == null) return;
+            audioSource.clip   = lullaby;
+            audioSource.volume = 0f;
+            audioSource.Play();
+            Log.LogInfo("Audio playing.");
+            StartCoroutine(FadeInMusic(3f));
+        }
+
+        private IEnumerator FadeInMusic(float duration)
+        {
+            float t = 0f;
+            while (t < duration)
+            {
+                t += Time.deltaTime;
+                audioSource.volume = Mathf.Clamp01(t / duration);
+                yield return null;
+            }
+            audioSource.volume = 1f;
+        }
+
+        private IEnumerator FadeOutMusic(float duration)
+        {
+            float startVolume = audioSource.volume;
+            float t = 0f;
+            while (t < duration)
+            {
+                t += Time.deltaTime;
+                audioSource.volume = Mathf.Clamp01(startVolume * (1f - t / duration));
+                yield return null;
+            }
+            audioSource.Stop();
+            audioSource.volume = 0f;
+        }
+
+        // ---- Config ----
 
         private void LoadConfig()
         {
@@ -157,6 +280,8 @@ namespace EepyDeepy
             LoadConfig();
         }
 
+        // ---- Sequence (server only) ----
+
         public void OnPlayerBedEnter(ZNetPeer peer, string trigger)
         {
             if (inBed) return;
@@ -172,7 +297,7 @@ namespace EepyDeepy
                 sequenceIndex  = 0;
                 Log.LogInfo($"Starting EepyDeepy sequence, triggered by {peer?.m_playerName} via {trigger}.");
                 StartCoroutine(RunSequence());
-                StartMusic();
+                playLullabyRPC.SendPackage(ZRoutedRpc.Everybody, new ZPackage());
             }
         }
 
@@ -207,42 +332,7 @@ namespace EepyDeepy
             playersInBed   = 0;
             lastBedPeer    = null;
             StopAllCoroutines();
-            StartCoroutine(FadeOutMusic(3f));
-        }
-
-        private void StartMusic()
-        {
-            if (lullaby == null) return;
-            audioSource.clip = lullaby;
-            audioSource.volume = 0f;
-            audioSource.Play();
-            StartCoroutine(FadeInMusic(3f));
-        }
-
-        private IEnumerator FadeInMusic(float duration)
-        {
-            float t = 0f;
-            while (t < duration)
-            {
-                t += Time.deltaTime;
-                audioSource.volume = Mathf.Clamp01(t / duration);
-                yield return null;
-            }
-            audioSource.volume = 1f;
-        }
-
-        private IEnumerator FadeOutMusic(float duration)
-        {
-            float startVolume = audioSource.volume;
-            float t = 0f;
-            while (t < duration)
-            {
-                t += Time.deltaTime;
-                audioSource.volume = Mathf.Clamp01(startVolume * (1f - t / duration));
-                yield return null;
-            }
-            audioSource.Stop();
-            audioSource.volume = 0f;
+            stopLullabyRPC.SendPackage(ZRoutedRpc.Everybody, new ZPackage());
         }
 
         private IEnumerator RunSequence()
@@ -274,7 +364,7 @@ namespace EepyDeepy
                 ZRoutedRpc.Everybody,
                 "ShowMessage",
                 (int)MessageHud.MessageType.Center,
-                text
+                                                text
             );
 
             Log.LogInfo($"[EepyDeepy] {text}");
@@ -287,6 +377,7 @@ namespace EepyDeepy
         }
     }
 
+    // Bed patches — still useful for dedicated server where bed interaction is server-side
     [HarmonyPatch(typeof(Bed), nameof(Bed.Interact))]
     public static class Patch_Bed_Interact
     {
@@ -332,6 +423,7 @@ namespace EepyDeepy
         }
     }
 
+    // Emote patches — client side, send RPC to server instead of triggering directly
     [HarmonyPatch(typeof(Player), nameof(Player.StartEmote))]
     public static class Patch_Player_StartEmote
     {
@@ -339,8 +431,11 @@ namespace EepyDeepy
         {
             if (emote != "rest") return;
 
-            EepyDeepyPlugin.Log.LogInfo($"Player {__instance.GetHoverName()} used rest emote, triggering sequence.");
-            EepyDeepyPlugin.Instance.OnPlayerBedEnter(null, "rest emote");
+            EepyDeepyPlugin.Log.LogInfo($"Player {__instance.GetHoverName()} used rest emote, notifying server.");
+            EepyDeepyPlugin.Instance.bedEnterRPC.SendPackage(
+                ZNet.instance.GetServerPeer().m_uid,
+                new ZPackage()
+            );
         }
     }
 
@@ -351,8 +446,11 @@ namespace EepyDeepy
         {
             if (Player.LastEmote != "rest") return;
 
-            EepyDeepyPlugin.Log.LogInfo($"Player {__instance.GetHoverName()} stopped rest emote.");
-            EepyDeepyPlugin.Instance.OnPlayerBedExit();
+            EepyDeepyPlugin.Log.LogInfo($"Player {__instance.GetHoverName()} stopped rest emote, notifying server.");
+            EepyDeepyPlugin.Instance.bedExitRPC.SendPackage(
+                ZNet.instance.GetServerPeer().m_uid,
+                new ZPackage()
+            );
         }
     }
 }

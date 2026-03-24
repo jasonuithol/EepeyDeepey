@@ -53,6 +53,7 @@ Each line is a sequence entry in the format `<seconds> <message>`:
 
 - Valheim `0.221.12` (network version 36)
 - BepInEx `5.4.23.x`
+- Jötunn  `2.28.0`
 - Required on both server and client
 
 ## Acknowlegements
