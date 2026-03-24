@@ -8,7 +8,7 @@ When any player gets into a bed, a sequence of increasingly unhinged messages is
 
 ## Features
 
-- Escalating message sequence triggered when a player gets into bed
+- A lullaby, and an escalating message sequence triggered when a player gets into bed
 - Sequence resets on successful sleep or when all players leave their beds
 - Use the `/rest` emote to trigger the sequence for testing (no bed required)
 - Fully configurable sequence — edit the messages and timing to your liking
@@ -20,8 +20,9 @@ When any player gets into a bed, a sequence of increasingly unhinged messages is
 
 1. Install [BepInEx 5.x](https://github.com/BepInEx/BepInEx/releases) on your Valheim server and clients
 2. Copy `EepyDeepy.dll` into `BepInEx/plugins/` on both server and clients
-3. Copy `eepydeepy.cfg` into `BepInEx/config/`
-4. Start the server
+3. Copy `lullaby.ogg` into `BepInEx/plugins/` on the client
+4. Copy `eepydeepy.cfg` into `BepInEx/config/`
+5. Start the server
 
 **This mod must be installed on both the server and all clients.**
 

@@ -1,7 +1,7 @@
 {
     "name": "EepyDeepy",
-    "version_number": "1.0.0",
-    "website_url": "",
+    "version_number": "1.0.1",
+    "website_url": "https://github.com/jasonuithol/EepeyDeepey",
     "description": "Gently — then not so gently — encourages your fellow Vikings to go to bed. Escalating messages broadcast to all players when someone gets into bed.",
     "dependencies": [
         "denikson-BepInExPack_Valheim-5.4.2333"
