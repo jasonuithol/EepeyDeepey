@@ -29,7 +29,7 @@ namespace EepyDeepy
     {
         public const string PluginGUID    = "com.byawn.eepydeepy";
         public const string PluginName    = "EepyDeepy";
-        public const string PluginVersion = "1.0.2";
+        public const string PluginVersion = "1.0.3";
 
         internal static ManualLogSource Log;
         internal static EepyDeepyPlugin Instance;
@@ -40,14 +40,11 @@ namespace EepyDeepy
         private string configPath;
         private FileSystemWatcher configWatcher;
         private DateTime lastConfigReload = DateTime.MinValue;
-        private DateTime lastBedExit      = DateTime.MinValue;
-        private bool inBed = false;
 
         // Sequence state (server only)
-        private int      sequenceIndex  = 0;
-        private bool     sequenceActive = false;
-        private int      playersInBed   = 0;
-        private ZNetPeer lastBedPeer    = null;
+        private int  sequenceIndex  = 0;
+        private bool sequenceActive = false;
+        private readonly HashSet<long> playersInBed = new HashSet<long>();
 
         // Audio (client only)
         private AudioSource audioSource;
@@ -127,9 +124,7 @@ namespace EepyDeepy
         private IEnumerator RPC_OnBedEnter(long sender, ZPackage package)
         {
             Log.LogInfo($"RPC_OnBedEnter received from {sender}.");
-
-            ZNetPeer peer = ZNet.instance.GetPeer(sender);
-            OnPlayerBedEnter(peer, "RPC");
+            OnPlayerBedEnter(sender, "RPC");
             yield break;
         }
 
@@ -137,7 +132,7 @@ namespace EepyDeepy
         private IEnumerator RPC_OnBedExit(long sender, ZPackage package)
         {
             Log.LogInfo($"RPC_OnBedExit received from {sender}.");
-            OnPlayerBedExit();
+            OnPlayerBedExit(sender);
             yield break;
         }
 
@@ -282,37 +277,34 @@ namespace EepyDeepy
 
         // ---- Sequence (server only) ----
 
-        public void OnPlayerBedEnter(ZNetPeer peer, string trigger)
+        public void OnPlayerBedEnter(long playerId, string trigger)
         {
-            if (inBed) return;
-            inBed = true;
+            if (!playersInBed.Add(playerId)) return; // already in bed
 
-            playersInBed++;
-            lastBedPeer = peer;
-            Log.LogInfo($"Player {peer?.m_playerName} triggered EepyDeepy via {trigger}. Players in bed: {playersInBed}");
+            string name = ZNet.instance?.GetPeer(playerId)?.m_playerName ?? "<host>";
+            Log.LogInfo($"Player {name} ({playerId}) triggered EepyDeepy via {trigger}. Players in bed: {playersInBed.Count}");
 
             if (!sequenceActive)
             {
                 sequenceActive = true;
                 sequenceIndex  = 0;
-                Log.LogInfo($"Starting EepyDeepy sequence, triggered by {peer?.m_playerName} via {trigger}.");
+                Log.LogInfo($"Starting EepyDeepy sequence, triggered by {name} via {trigger}.");
                 StartCoroutine(RunSequence());
                 playLullabyRPC.SendPackage(ZRoutedRpc.Everybody, new ZPackage());
+                // Jotunn CustomRPC.SendPackage(Everybody) does not self-deliver on the host,
+                // so trigger local audio directly when the host has a client UI.
+                if (!GUIManager.IsHeadless()) StartMusic();
             }
         }
 
-        public void OnPlayerBedExit()
+        public void OnPlayerBedExit(long playerId)
         {
-            if (!inBed) return;
-            inBed = false;
+            if (!playersInBed.Remove(playerId)) return; // wasn't tracked
 
-            if ((DateTime.Now - lastBedExit).TotalSeconds < 2) return;
-            lastBedExit = DateTime.Now;
+            string name = ZNet.instance?.GetPeer(playerId)?.m_playerName ?? "<host>";
+            Log.LogInfo($"Player {name} ({playerId}) left bed. Players in bed: {playersInBed.Count}");
 
-            playersInBed = Math.Max(0, playersInBed - 1);
-            Log.LogInfo($"Player left bed. Players in bed: {playersInBed}");
-
-            if (playersInBed == 0)
+            if (playersInBed.Count == 0)
             {
                 ResetSequence("all players left bed");
             }
@@ -326,13 +318,12 @@ namespace EepyDeepy
         private void ResetSequence(string reason)
         {
             Log.LogInfo($"Resetting sequence: {reason}.");
-            inBed          = false;
             sequenceActive = false;
             sequenceIndex  = 0;
-            playersInBed   = 0;
-            lastBedPeer    = null;
+            playersInBed.Clear();
             StopAllCoroutines();
             stopLullabyRPC.SendPackage(ZRoutedRpc.Everybody, new ZPackage());
+            if (!GUIManager.IsHeadless()) StartCoroutine(FadeOutMusic(3f));
         }
 
         private IEnumerator RunSequence()
@@ -377,39 +368,74 @@ namespace EepyDeepy
         }
     }
 
-    // Bed patches — still useful for dedicated server where bed interaction is server-side
-    [HarmonyPatch(typeof(Bed), nameof(Bed.Interact))]
-    public static class Patch_Bed_Interact
+    // Helpers shared by bed/emote client patches. Safe to call on a host or in single-player:
+    // when we are already the server, dispatch directly instead of RPCing ourselves
+    // (GetServerPeer() returns null in that case).
+    internal static class BedNotify
     {
-        static void Postfix(Humanoid human, bool __result)
+        public static void Enter(string trigger)
         {
-            if (!ZNet.instance.IsServer()) return;
-            if (!__result) return;
+            if (ZNet.instance == null) return;
+            if (EepyDeepyPlugin.Instance == null) return;
 
-            ZNetPeer peer = null;
-            foreach (var p in ZNet.instance.GetPeers())
+            if (ZNet.instance.IsServer())
             {
-                if (p.m_playerName == human.GetHoverName())
-                {
-                    peer = p;
-                    break;
-                }
+                EepyDeepyPlugin.Instance.OnPlayerBedEnter(ZNet.GetUID(), trigger);
+                return;
             }
 
-            EepyDeepyPlugin.Instance.OnPlayerBedEnter(peer, "entered bed");
+            ZNetPeer server = ZNet.instance.GetServerPeer();
+            if (server == null) return;
+            EepyDeepyPlugin.Instance.bedEnterRPC.SendPackage(server.m_uid, new ZPackage());
+        }
+
+        public static void Exit()
+        {
+            if (ZNet.instance == null) return;
+            if (EepyDeepyPlugin.Instance == null) return;
+
+            if (ZNet.instance.IsServer())
+            {
+                EepyDeepyPlugin.Instance.OnPlayerBedExit(ZNet.GetUID());
+                return;
+            }
+
+            ZNetPeer server = ZNet.instance.GetServerPeer();
+            if (server == null) return;
+            EepyDeepyPlugin.Instance.bedExitRPC.SendPackage(server.m_uid, new ZPackage());
         }
     }
 
-    [HarmonyPatch(typeof(Bed), "SetOwner")]
-    public static class Patch_Bed_SetOwner
+    // Bed patches — client-side detection of getting into / out of a bed.
+    // Bed.Interact runs on the interacting client and always returns false, so we hook
+    // the actual attach state change instead and notify the server.
+    [HarmonyPatch(typeof(Player), nameof(Player.AttachStart))]
+    public static class Patch_Player_AttachStart
     {
-        static void Postfix(long uid)
+        static void Postfix(Player __instance, bool isBed)
         {
-            if (!ZNet.instance.IsServer()) return;
-            if (uid == 0)
-            {
-                EepyDeepyPlugin.Instance.OnPlayerBedExit();
-            }
+            if (!isBed) return;
+            if (__instance != Player.m_localPlayer) return;
+
+            EepyDeepyPlugin.Log.LogInfo($"Local player got into bed, notifying server.");
+            BedNotify.Enter("entered bed");
+        }
+    }
+
+    [HarmonyPatch(typeof(Player), nameof(Player.AttachStop))]
+    public static class Patch_Player_AttachStop
+    {
+        static void Prefix(Player __instance, out bool __state)
+        {
+            __state = __instance == Player.m_localPlayer && __instance.InBed();
+        }
+
+        static void Postfix(bool __state)
+        {
+            if (!__state) return;
+
+            EepyDeepyPlugin.Log.LogInfo($"Local player got out of bed, notifying server.");
+            BedNotify.Exit();
         }
     }
 
@@ -423,34 +449,30 @@ namespace EepyDeepy
         }
     }
 
-    // Emote patches — client side, send RPC to server instead of triggering directly
+    // Emote patches — client side, notify the server when /rest starts/stops.
     [HarmonyPatch(typeof(Player), nameof(Player.StartEmote))]
     public static class Patch_Player_StartEmote
     {
         static void Postfix(string emote, Player __instance)
         {
             if (emote != "rest") return;
+            if (__instance != Player.m_localPlayer) return;
 
-            EepyDeepyPlugin.Log.LogInfo($"Player {__instance.GetHoverName()} used rest emote, notifying server.");
-            EepyDeepyPlugin.Instance.bedEnterRPC.SendPackage(
-                ZNet.instance.GetServerPeer().m_uid,
-                new ZPackage()
-            );
+            EepyDeepyPlugin.Log.LogInfo($"Local player used rest emote, notifying server.");
+            BedNotify.Enter("/rest");
         }
     }
 
     [HarmonyPatch(typeof(Player), "StopEmote")]
     public static class Patch_Player_StopEmote
     {
-        static void Prefix(Player __instance)
+        static void Postfix(Player __instance)
         {
             if (Player.LastEmote != "rest") return;
+            if (__instance != Player.m_localPlayer) return;
 
-            EepyDeepyPlugin.Log.LogInfo($"Player {__instance.GetHoverName()} stopped rest emote, notifying server.");
-            EepyDeepyPlugin.Instance.bedExitRPC.SendPackage(
-                ZNet.instance.GetServerPeer().m_uid,
-                new ZPackage()
-            );
+            EepyDeepyPlugin.Log.LogInfo($"Local player stopped rest emote, notifying server.");
+            BedNotify.Exit();
         }
     }
 }

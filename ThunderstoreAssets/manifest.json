@@ -1,6 +1,7 @@
 {
+    "namespace": "tarbaby",
     "name": "EepyDeepy",
-    "version_number": "1.0.2",
+    "version_number": "1.0.3",
     "website_url": "https://github.com/jasonuithol/EepeyDeepey",
     "description": "Gently — then not so gently — encourages your fellow Vikings to go to bed. Escalating messages broadcast to all players when someone gets into bed.",
     "dependencies": [
